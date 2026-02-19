@@ -162,6 +162,10 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             "length of switch_frame_indices should be one less than text_prompts_list"
         )
         assert num_output_frames % self.num_frame_per_block == 0
+        if num_output_frames % self.num_frame_per_block != 0:
+            raise ValueError(
+                f"num_output_frames ({num_output_frames}) must be divisible by num_frame_per_block ({self.num_frame_per_block})"
+            )
         num_blocks = num_output_frames // self.num_frame_per_block
 
         # encode all prompts

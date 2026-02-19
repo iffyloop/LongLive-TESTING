@@ -13,10 +13,10 @@ model_kwargs:
   sink_size: 3
 
 # Inference
-data_path: examples-ttm/camcontrol_ConcertStage/camcontrol_ConcertStage.jsonl
-output_folder: videos/interactive_ttm_camcontrol_concertstage
+data_path: examples-ttm/cutdrag_wan_Monkey/cutdrag_wan_Monkey.jsonl
+output_folder: videos/interactive_ttm_cutdrag_wan_monkey
 inference_iter: -1
-# For Wan VAE temporal factor 4, 21 latent frames decode to 81 RGB frames.
+# 21 latent frames decode to ~81 RGB frames for Wan temporal factor 4.
 num_output_frames: 21
 use_ema: false
 seed: 1
@@ -42,10 +42,11 @@ adapter:
 ttm:
   enabled: true
   mode: "file"
-  motion_signal_video_path: examples-ttm/camcontrol_ConcertStage/motion_signal.mp4
-  motion_signal_mask_path: examples-ttm/camcontrol_ConcertStage/mask.mp4
-  tweak_index: 1
-  tstrong_index: 3
+  motion_signal_video_path: examples-ttm/cutdrag_wan_Monkey/motion_signal.mp4
+  motion_signal_mask_path: examples-ttm/cutdrag_wan_Monkey/mask.mp4
+  # Wan TTM reference defaults
+  tweak_index: 3
+  tstrong_index: 6
   threshold: 0.5
   mask_dilate: 0
   warmup_blocks: 0

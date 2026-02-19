@@ -142,6 +142,8 @@ class WanVAEWrapper(torch.nn.Module):
     def decode_to_pixel(
         self, latent: torch.Tensor, use_cache: bool = False
     ) -> torch.Tensor:
+        model_dtype = next(self.model.parameters()).dtype
+        latent = latent.to(dtype=model_dtype)
         zs = latent.permute(0, 2, 1, 3, 4)
         if use_cache:
             assert latent.shape[0] == 1, "Batch size must be 1 when using cache"
@@ -184,6 +186,8 @@ class WanVAEWrapper(torch.nn.Module):
         """
         # latent shape: [batch_size, num_frames, num_channels, height, width]
         # zs shape after permute: [batch_size, num_channels, num_frames, height, width]
+        model_dtype = next(self.model.parameters()).dtype
+        latent = latent.to(dtype=model_dtype)
         zs = latent.permute(0, 2, 1, 3, 4)
         if use_cache:
             assert latent.shape[0] == 1, "Batch size must be 1 when using cache"

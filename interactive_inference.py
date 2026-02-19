@@ -76,6 +76,58 @@ else:
 low_memory = get_cuda_free_memory_gb(device) < 40
 torch.set_grad_enabled(False)
 
+# ----------------------------- Lightweight TTM preflight -----------------------------
+ttm_cfg = normalize_ttm_config(
+    getattr(config, "ttm", None), len(config.denoising_step_list)
+)
+preloaded_ttm_provider = None
+if ttm_cfg["enabled"]:
+    if ttm_cfg["mode"] == "stream":
+        raise NotImplementedError(
+            "ttm.mode='stream' is not wired in interactive_inference.py yet. "
+            "Use ttm.mode='file' with motion_signal_video_path/motion_signal_mask_path."
+        )
+
+    motion_path = getattr(config.ttm, "motion_signal_video_path", None)
+    mask_path = getattr(config.ttm, "motion_signal_mask_path", None)
+    if not motion_path or not mask_path:
+        raise ValueError(
+            "TTM enabled but motion_signal_video_path/motion_signal_mask_path missing in config.ttm"
+        )
+
+    preloaded_ttm_provider = FileTTMInputProvider(motion_path, mask_path)
+
+    num_output_frames = int(config.num_output_frames)
+    num_frame_per_block = int(config.num_frame_per_block)
+    if num_output_frames % num_frame_per_block != 0:
+        raise ValueError(
+            f"num_output_frames ({num_output_frames}) must be divisible by num_frame_per_block ({num_frame_per_block})"
+        )
+
+    # Wan VAE temporal stride is 4 for currently supported configs.
+    temporal_factor = (
+        4 if str(getattr(config, "model_name", "")).startswith("Wan") else 1
+    )
+    required_ttm_frames = 1 + (num_output_frames - 1) * temporal_factor
+
+    motion_frames = int(preloaded_ttm_provider.motion_video.shape[1])
+    mask_frames = int(preloaded_ttm_provider.mask_video.shape[1])
+    if motion_frames < required_ttm_frames:
+        raise ValueError(
+            f"motion_signal_video_path has {motion_frames} frames, but TTM needs at least {required_ttm_frames} "
+            f"for num_output_frames={num_output_frames} and temporal_factor={temporal_factor}"
+        )
+    if mask_frames < required_ttm_frames:
+        raise ValueError(
+            f"motion_signal_mask_path has {mask_frames} frames, but TTM needs at least {required_ttm_frames} "
+            f"for num_output_frames={num_output_frames} and temporal_factor={temporal_factor}"
+        )
+
+    if local_rank == 0:
+        print(
+            f"TTM preflight OK: motion={motion_frames}f mask={mask_frames}f required={required_ttm_frames}f"
+        )
+
 pipeline = InteractiveCausalInferencePipeline(config, device=device)
 
 if config.generator_ckpt:
@@ -150,23 +202,10 @@ pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
 # ----------------------------- Build dataset -----------------------------
-ttm_cfg = normalize_ttm_config(
-    getattr(config, "ttm", None), len(config.denoising_step_list)
-)
-ttm_provider = None
+ttm_provider = preloaded_ttm_provider
 if ttm_cfg["enabled"]:
-    if ttm_cfg["mode"] == "stream":
-        raise NotImplementedError(
-            "ttm.mode='stream' is not wired in interactive_inference.py yet. "
-            "Use ttm.mode='file' with motion_signal_video_path/motion_signal_mask_path."
-        )
-    motion_path = getattr(config.ttm, "motion_signal_video_path", None)
-    mask_path = getattr(config.ttm, "motion_signal_mask_path", None)
-    if not motion_path or not mask_path:
-        raise ValueError(
-            "TTM enabled but motion_signal_video_path/motion_signal_mask_path missing in config.ttm"
-        )
-    ttm_provider = FileTTMInputProvider(motion_path, mask_path)
+    if ttm_provider is None:
+        raise RuntimeError("TTM provider not initialized")
 
 # Parse switch_frame_indices
 if isinstance(config.switch_frame_indices, int):
