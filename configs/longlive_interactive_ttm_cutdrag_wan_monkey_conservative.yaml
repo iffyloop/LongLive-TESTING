@@ -1,0 +1,56 @@
+# Architecture
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+
+# Inference
+data_path: examples-ttm/cutdrag_wan_Monkey/cutdrag_wan_Monkey.jsonl
+output_folder: videos/interactive_ttm_cutdrag_wan_monkey_conservative
+inference_iter: -1
+num_output_frames: 21
+use_ema: false
+seed: 1
+num_samples: 1
+save_with_index: true
+save_chunk_previews: true
+chunk_preview_fps: 16
+switch_frame_indices: ""
+global_sink: true
+context_noise: 0
+
+generator_ckpt: longlive_models/models/longlive_base.pt
+lora_ckpt: longlive_models/models/lora.pt
+
+adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false
+
+ttm:
+  enabled: true
+  mode: "file"
+  motion_signal_video_path: examples-ttm/cutdrag_wan_Monkey/motion_signal.mp4
+  motion_signal_mask_path: examples-ttm/cutdrag_wan_Monkey/mask.mp4
+  # Conservative masked forcing for 4-step distilled schedule.
+  tweak_index: 1
+  tstrong_index: 2
+  threshold: 0.75
+  mask_dilate: 0
+  warmup_blocks: 0
+  apply_after_prompt_switch: true
+  deterministic_ref_noise: true
+  ref_noise_seed: 0
+  stream_decode: false
+  use_cached_decode: false
