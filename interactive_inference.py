@@ -22,13 +22,15 @@ from torchvision import transforms  # noqa: F401
 from einops import rearrange
 
 from utils.misc import set_seed
-from utils.distributed import barrier  
+from utils.distributed import barrier
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 
 from pipeline.interactive_causal_inference import (
     InteractiveCausalInferencePipeline,
 )
 from utils.dataset import MultiTextDataset
+from utils.ttm_config import normalize_ttm_config
+from utils.ttm_stream import FileTTMInputProvider
 
 
 # ----------------------------- Argument parsing -----------------------------
@@ -43,24 +45,24 @@ if "LOCAL_RANK" in os.environ:
     os.environ["NCCL_CROSS_NIC"] = "1"
     os.environ["NCCL_DEBUG"] = os.environ.get("NCCL_DEBUG", "INFO")
     os.environ["NCCL_TIMEOUT"] = os.environ.get("NCCL_TIMEOUT", "1800")
-    
+
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", str(local_rank)))
-    
+
     # Set device first
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    
+
     # Initialize process group with backend and timeout
     if not dist.is_initialized():
         dist.init_process_group(
             backend="nccl",
             rank=rank,
             world_size=world_size,
-            timeout=torch.distributed.constants.default_pg_timeout
+            timeout=torch.distributed.constants.default_pg_timeout,
         )
-    
+
     set_seed(config.seed + local_rank)
     print(f"[Rank {rank}] Initialized distributed processing on device {device}")
 else:
@@ -81,6 +83,7 @@ if config.generator_ckpt:
     raw_gen_state_dict = state_dict["generator_ema" if config.use_ema else "generator"]
 
     if config.use_ema:
+
         def _clean_key(name: str) -> str:
             return name.replace("_fsdp_wrapped_module.", "")
 
@@ -92,7 +95,9 @@ if config.generator_ckpt:
             if missing:
                 print(f"[Warning] {len(missing)} parameters missing: {missing[:8]} ...")
             if unexpected:
-                print(f"[Warning] {len(unexpected)} unexpected params: {unexpected[:8]} ...")
+                print(
+                    f"[Warning] {len(unexpected)} unexpected params: {unexpected[:8]} ..."
+                )
     else:
         pipeline.generator.load_state_dict(raw_gen_state_dict)
 
@@ -121,14 +126,18 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
         lora_checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
         # Support both formats: containing the `generator_lora` key or a raw LoRA state dict
         if isinstance(lora_checkpoint, dict) and "generator_lora" in lora_checkpoint:
-            peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint["generator_lora"])  # type: ignore
+            peft.set_peft_model_state_dict(
+                pipeline.generator.model, lora_checkpoint["generator_lora"]
+            )  # type: ignore
         else:
             peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint)  # type: ignore
         if local_rank == 0:
             print("LoRA weights loaded for generator")
     else:
         if local_rank == 0:
-            print("No LoRA checkpoint specified; using base weights with LoRA adapters initialized")
+            print(
+                "No LoRA checkpoint specified; using base weights with LoRA adapters initialized"
+            )
 
     pipeline.is_lora_enabled = True
 
@@ -141,6 +150,24 @@ pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
 # ----------------------------- Build dataset -----------------------------
+ttm_cfg = normalize_ttm_config(
+    getattr(config, "ttm", None), len(config.denoising_step_list)
+)
+ttm_provider = None
+if ttm_cfg["enabled"]:
+    if ttm_cfg["mode"] == "stream":
+        raise NotImplementedError(
+            "ttm.mode='stream' is not wired in interactive_inference.py yet. "
+            "Use ttm.mode='file' with motion_signal_video_path/motion_signal_mask_path."
+        )
+    motion_path = getattr(config.ttm, "motion_signal_video_path", None)
+    mask_path = getattr(config.ttm, "motion_signal_mask_path", None)
+    if not motion_path or not mask_path:
+        raise ValueError(
+            "TTM enabled but motion_signal_video_path/motion_signal_mask_path missing in config.ttm"
+        )
+    ttm_provider = FileTTMInputProvider(motion_path, mask_path)
+
 # Parse switch_frame_indices
 if isinstance(config.switch_frame_indices, int):
     switch_frame_indices: List[int] = [int(config.switch_frame_indices)]
@@ -169,11 +196,19 @@ if dist.is_initialized():
 else:
     sampler = SequentialSampler(dataset)
 
-dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False)
+dataloader = DataLoader(
+    dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False
+)
 
 # Create output directory
 if local_rank == 0:
     os.makedirs(config.output_folder, exist_ok=True)
+
+save_chunk_previews = bool(getattr(config, "save_chunk_previews", False))
+chunk_preview_fps = int(getattr(config, "chunk_preview_fps", 16))
+chunk_output_dir = os.path.join(config.output_folder, "chunks")
+if save_chunk_previews and local_rank == 0:
+    os.makedirs(chunk_output_dir, exist_ok=True)
 
 if dist.is_initialized():
     dist.barrier()
@@ -195,12 +230,53 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         dtype=torch.bfloat16,
     )
 
-    video = pipeline.inference(
-        noise=sampled_noise,
-        text_prompts_list=prompts_list,
-        switch_frame_indices=switch_frame_indices,
-        return_latents=False,
-    )
+    if ttm_cfg["enabled"]:
+        streamed_chunks = {}
+
+        def _on_video_chunk(video_chunk: torch.Tensor, start_frame: int) -> None:
+            if ttm_cfg["stream_decode"]:
+                streamed_chunks[start_frame] = video_chunk.detach().cpu()
+
+            if save_chunk_previews:
+                os.makedirs(chunk_output_dir, exist_ok=True)
+                chunk_video = (
+                    rearrange(video_chunk, "b t c h w -> b t h w c").cpu() * 255.0
+                )
+                for sample_idx in range(chunk_video.shape[0]):
+                    chunk_path = os.path.join(
+                        chunk_output_dir,
+                        f"rank{rank}-idx{idx}-seed{sample_idx}-start{start_frame:04d}.mp4",
+                    )
+                    write_video(
+                        chunk_path,
+                        chunk_video[sample_idx].to(torch.uint8),
+                        fps=chunk_preview_fps,
+                    )
+
+        video = pipeline.inference_stream_ttm(
+            noise=sampled_noise,
+            text_prompts_list=prompts_list,
+            switch_frame_indices=switch_frame_indices,
+            ttm_provider=ttm_provider,
+            ttm_cfg=ttm_cfg,
+            return_latents=False,
+            low_memory=low_memory,
+            on_video_chunk=(
+                _on_video_chunk
+                if (ttm_cfg["stream_decode"] or save_chunk_previews)
+                else None
+            ),
+        )
+        if ttm_cfg["stream_decode"] and streamed_chunks:
+            ordered = [streamed_chunks[k] for k in sorted(streamed_chunks.keys())]
+            video = torch.cat(ordered, dim=1).to(device=device, dtype=video.dtype)
+    else:
+        video = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts_list=prompts_list,
+            switch_frame_indices=switch_frame_indices,
+            return_latents=False,
+        )
 
     current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0
 
@@ -210,24 +286,29 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         rank = 0
 
     # Determine model type for filename
-    if hasattr(pipeline, 'is_lora_enabled') and pipeline.is_lora_enabled:
+    if hasattr(pipeline, "is_lora_enabled") and pipeline.is_lora_enabled:
         model_type = "lora"
-    elif getattr(config, 'use_ema', False):
+    elif getattr(config, "use_ema", False):
         model_type = "ema"
     else:
         model_type = "regular"
 
     for seed_idx in range(config.num_samples):
         if config.save_with_index:
-            output_path = os.path.join(config.output_folder, f"rank{rank}-{idx}-{seed_idx}_{model_type}.mp4")
+            output_path = os.path.join(
+                config.output_folder, f"rank{rank}-{idx}-{seed_idx}_{model_type}.mp4"
+            )
         else:
             # Use the first prompt segment as the filename prefix to avoid overly long names
             short_name = prompts_list[0][0][:100].replace("/", "_")
-            output_path = os.path.join(config.output_folder, f"rank{rank}-{short_name}-{seed_idx}_{model_type}.mp4")
+            output_path = os.path.join(
+                config.output_folder,
+                f"rank{rank}-{short_name}-{seed_idx}_{model_type}.mp4",
+            )
         write_video(output_path, current_video[seed_idx].to(torch.uint8), fps=16)
 
     if config.inference_iter != -1 and i >= config.inference_iter:
         break
 
 if dist.is_initialized():
-    dist.destroy_process_group() 
+    dist.destroy_process_group()
