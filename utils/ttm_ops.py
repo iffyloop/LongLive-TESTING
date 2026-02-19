@@ -39,6 +39,7 @@ def prepare_motion_latents(
     motion = motion_bcthw.to(device=device, dtype=torch.float32)
     motion = _resize_spatial_bcthw(motion, pixel_h, pixel_w, mode="bicubic")
     motion = motion * 2.0 - 1.0
+    motion = motion.to(dtype=dtype)
     ref_latents = vae.encode_to_latent(motion)
 
     if drop_first_latent:
